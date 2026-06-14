@@ -1,0 +1,24 @@
+{
+  "goal": "Add input validation to the /signup endpoint",
+  "contract": {
+    "definition_of_done": "POST /signup rejects a missing or invalid email with HTTP 400 + a JSON error body; no other endpoint changes.",
+    "acceptance_tests": ["test_signup_missing_email_400", "test_signup_invalid_email_400"],
+    "immutable": ["acceptance_tests"],
+    "constraints": ["do not touch any endpoint other than /signup"],
+    "autonomy_ceiling": 0,
+    "proposed_by": "claude-opus (planner)",
+    "ratified_by": "council (grok+codex+glm), independent of the proposer"
+  },
+  "repo": "/Users/sem/code/SOME-REAL-REPO",
+  "mode": "propose",
+  "worker_cmd": "claude -p \"{task}\" --permission-mode acceptEdits",
+  "verify_cmd": "npm test",
+  "max_attempts": 3,
+  "tick_seconds": 2,
+  "budget": { "max_worker_runs": 12, "max_wall_seconds": 1800 },
+  "tasks": [
+    { "id": "t1", "goal": "Write a failing test: POST /signup with no email returns 400", "status": "pending" },
+    { "id": "t2", "goal": "Make /signup reject a missing email with 400 + a JSON error body", "status": "pending" },
+    { "id": "t3", "goal": "Make the new test pass; do not touch any other endpoint", "status": "pending" }
+  ]
+}

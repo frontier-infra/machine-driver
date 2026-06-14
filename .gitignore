@@ -1,0 +1,17 @@
+# live run state — never commit (may carry real repo paths / progress)
+goal.json
+*.tmp
+
+# proof + loop artifacts produced at runtime
+aar.jsonl
+driver-log.jsonl
+aar/
+
+# signing material — NEVER commit
+secrets/
+*.jwk.json
+
+# python
+__pycache__/
+*.pyc
+.venv/

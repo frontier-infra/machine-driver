@@ -17,9 +17,12 @@ adding a single model token to the loop — every addition below is deterministi
            (ratified_by != proposed_by). Missing / self-ratified -> forced propose-only.
            (The Council is the natural ratifier here — independent judgment on the
            TARGET. Ground-truth tests stay the Box 4 verifier; a model panel is not.)
-  - Box 4  AAR — every transition appends a hash-chained receipt to aar.jsonl: the
-           proof layer, not the worker's claim. (Minimal/AAR-shaped for now; to be
-           reconciled with the canonical signed AAR spec — agentscontrolplane.org.)
+  - Box 4  PROOF — TWO artifacts, split cleanly (iteration 2, 2026-06-14):
+           driver-log.jsonl = the hash-chained loop AUDIT (dispatch/requeue/halt);
+           aar/<task-id>.json = one canonical, Ed25519-SIGNED AAR per resolved task,
+           signed via our own agentscontrolplane.org signer. The signed AAR is the
+           proof layer (verifier ≠ subject ⇒ AAR L2); the log is telemetry. Runs
+           keyless (skips AAR) when no signing identity is configured.
   - Box 5  GOVERNOR — a goal-level budget (worker-runs / wall-clock). Breach -> HALT
            + operator alert. THIS is the control the 131-duplicate incident lacked.
            AUTONOMY — effective = min(operator mode, contract ceiling, verifier trust);
@@ -39,6 +42,7 @@ from __future__ import annotations  # keep type hints lazy so this runs on Pytho
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -48,7 +52,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 GOAL_PATH = Path(sys.argv[1] if len(sys.argv) > 1 else "goal.json")
-AAR_PATH = GOAL_PATH.with_name("aar.jsonl")
+DRIVER_LOG_PATH = GOAL_PATH.with_name("driver-log.jsonl")  # hash-chained loop audit (was aar.jsonl)
+AAR_DIR = GOAL_PATH.with_name("aar")                       # one canonical SIGNED AAR per resolved task
 
 
 def now() -> str:
@@ -90,19 +95,19 @@ def alert(msg: str) -> None:
         print(f"[{now()}]    (alert send failed: {e})")
 
 
-def aar_append(record: dict) -> str:
-    # Box 4 proof layer: an append-only, hash-chained receipt per transition. Each
-    # line carries the previous line's hash, so a tampered/missing record breaks the
-    # chain. Minimal + AAR-SHAPED (prev/hash/idempotency_key/verifier/autonomy) — the
-    # canonical *signed* AAR (agentscontrolplane.org) is a later reconciliation pass.
+def log_append(record: dict) -> str:
+    # Driver-loop AUDIT (driver-log.jsonl): an append-only, hash-chained line per transition.
+    # Each line carries the previous line's hash, so a tampered/missing record breaks the
+    # chain. This is loop telemetry (dispatch/requeue/halt), NOT the proof layer — the
+    # canonical *signed* AAR per resolved task is emit_aar() below (agentscontrolplane.org).
     prev = ""
-    if AAR_PATH.exists():
-        lines = AAR_PATH.read_text().splitlines()
+    if DRIVER_LOG_PATH.exists():
+        lines = DRIVER_LOG_PATH.read_text().splitlines()
         if lines:
             prev = json.loads(lines[-1]).get("hash", "")
     record = {"ts": now(), "prev_hash": prev, **record}
     record["hash"] = hashlib.sha256((prev + json.dumps(record, sort_keys=True)).encode()).hexdigest()[:16]
-    with AAR_PATH.open("a") as f:
+    with DRIVER_LOG_PATH.open("a") as f:
         f.write(json.dumps(record) + "\n")
     return record["hash"]
 
@@ -115,6 +120,49 @@ def idem_key(goal_id: str, task: dict) -> str:
     return hashlib.sha256(f"{goal_id}|{task['id']}|{task['goal']}".encode()).hexdigest()[:16]
 
 
+def emit_aar(task: dict, vcode: int, vout: str, repo: str, verify_cmd, aar_cfg: dict):
+    """Box-4 PROOF: one canonical, Ed25519-signed AAR per RESOLVED task — our own standard
+    (agentscontrolplane.org), so the driver MUST emit it. Deterministic plumbing; no model
+    token. If the signing identity/key isn't configured the driver runs KEYLESS: skip the AAR
+    (driver-log.jsonl still records the loop). The verify step already gives `verifier ≠ subject`.
+    """
+    tool, priv = aar_cfg.get("aar_tool"), aar_cfg.get("aar_priv")
+    subject, principal = aar_cfg.get("subject"), aar_cfg.get("principal")
+    if not (tool and priv and subject and principal):
+        return None  # keyless — no signing identity; loop audit still written
+    AAR_DIR.mkdir(parents=True, exist_ok=True)
+    verified = vcode == 0
+    rec = {
+        "aar": "0.02",
+        "subject": subject,                                  # the worker — did:web:<org>:machine-driver
+        "principal": principal,                              # the signing org — did:web:<org> (= sig.by)
+        "task": {"id": task["id"], "claim": task["goal"]},
+        "verdict": "verified" if verified else "rejected",
+        "ground_truth": "confirmed" if verified else "contradicted",
+        "reason": f"verify_cmd exited {vcode} against repo HEAD",
+        "checks": [{
+            "source": repo,
+            "query": verify_cmd or "(no verify_cmd)",
+            "observed_at": now(),
+            "response_sha256": hashlib.sha256((vout or "").encode()).hexdigest(),
+            "excerpt": (vout or "")[-300:],
+        }],
+        # verifier ≠ subject ⇒ AAR L2 (structural independence; same org ⇒ disclosed, not audit-grade)
+        "verifier": {"id": aar_cfg.get("verifier") or f"{principal}:verifier", "independence": "same_principal"},
+        "issued": now(),
+    }
+    out = AAR_DIR / f"{task['id']}.json"
+    out.write_text(json.dumps(rec, indent=2))
+    # sign with OUR OWN signer (eat our own cooking) — driver stays pure-Python, shells to node.
+    rc, sout = run(
+        f"node {shlex.quote(str(tool))} sign {shlex.quote(str(out))} --priv {shlex.quote(str(priv))}",
+        str(GOAL_PATH.resolve().parent),
+    )
+    if rc != 0:
+        alert(f"AAR sign FAILED for task {task['id']} (rc {rc}): {sout.strip().splitlines()[-1] if sout.strip() else '?'}")
+    return str(out)
+
+
 def next_pending(state: dict) -> dict | None:
     for t in state["tasks"]:
         if t.get("status", "pending") == "pending":
@@ -122,20 +170,88 @@ def next_pending(state: dict) -> dict | None:
     return None
 
 
-def effective_mode(state: dict) -> tuple[str, str]:
-    # Box 5 keystone: effective autonomy = min(operator mode, contract ceiling, verifier
-    # trust). NO verifier (no verify_cmd) => trust 0 => propose-only, no matter what's
-    # asked. autonomy_ceiling scale: 0=propose · 1+=commit-allowed (full dial is later).
+def contract_ratified(contract: dict) -> bool:
+    # Box 0: a contract is INDEPENDENTLY ratified iff it exists and a THIRD party ratified
+    # its target — ratified_by is present and is not the proposer. Missing / self-ratified
+    # ⇒ not ratified. This is the predicate the durable-mutation hard-deny gates on.
+    if not contract:
+        return False
+    return bool(contract.get("ratified_by")) and contract.get("ratified_by") != contract.get("proposed_by")
+
+
+def effective_mode(state: dict, task: dict | None = None) -> tuple[str, str]:
+    # Box 5 keystone (deterministic; no model token). The autonomy TIER granted is the
+    # contract's autonomy_ceiling; the operator dial (commit/propose) and verifier trust
+    # are binary admissions. Commit proceeds iff: operator asked commit AND a verifier is
+    # present (trust 1) AND the granted ceiling clears the tier THIS action REQUIRES.
+    # NO verifier (no verify_cmd) => trust 0 => propose-only, no matter what's asked.
+    # autonomy_ceiling scale: 0=propose · 1+=commit-allowed (full dial is later).
+    #
+    # Δ1 (vNext Box 5) — reversibility is a TERM INSIDE the evaluated gate, not commentary:
+    # a reversible action clears the baseline commit tier (>=1); an IRREVERSIBLE action must
+    # clear the higher bar contract.irreversible_min_trust. A missing per-task `reversible`
+    # defaults to False (treat as irreversible); a missing irreversible_min_trust defaults
+    # to the STRICTEST reading (deny autonomous irreversible commit until the contract opts
+    # in by raising the ceiling to meet it).
     asked = state.get("mode", "propose")
     contract = state.get("contract") or {}
     ceiling = contract.get("autonomy_ceiling", 0)
     trust = 1 if state.get("verify_cmd") else 0
-    if asked == "commit" and ceiling >= 1 and trust >= 1:
-        return "commit", "operator=commit · ceiling>=1 · verifier present"
-    why = ("no verifier -> trust 0" if not trust
-           else "contract ceiling forbids commit" if ceiling < 1
-           else "operator asked propose")
+    reversible = bool(task.get("reversible", False)) if task is not None else False
+    if reversible:
+        required = 1                                  # baseline commit tier
+    else:
+        irr = contract.get("irreversible_min_trust")  # higher bar for irreversible actions
+        required = irr if isinstance(irr, int) and not isinstance(irr, bool) and irr >= 1 else float("inf")
+    if asked == "commit" and trust >= 1 and ceiling >= required:
+        note = "reversible" if reversible else f"irreversible · ceiling {ceiling}>={required}"
+        return "commit", f"operator=commit · {note} · verifier present"
+    if not trust:
+        why = "no verifier -> trust 0"
+    elif asked != "commit":
+        why = "operator asked propose"
+    elif ceiling < 1:
+        why = "contract ceiling forbids commit"
+    elif not reversible and ceiling < required:
+        req = "strictest" if required == float("inf") else required
+        why = f"irreversible action needs ceiling>={req} (have {ceiling})"
+    else:
+        why = "operator asked propose"
     return "propose", why
+
+
+def apply_mutation(repo: str, task: dict, mode: str, state: dict) -> bool:
+    """THE single named path to a durable mutation — every git commit routes through here,
+    so "all mutation via the gate" is ONE auditable chokepoint (non-bypassable). It
+    RE-CHECKS the Box-5 gate at the mutation site (defense in depth, not just where the
+    decision was first taken) and enforces the Box-0 contract before committing. Returns
+    True iff it committed; False if it REFUSED (caller leaves the diff in the working tree).
+
+    Acknowledged residue, OUT OF SCOPE here: the pre-gate `worker_cmd` shell-out in main()'s
+    WORKER step already edits the working tree BEFORE this gate runs; that pre-gate tree
+    mutation is not yet routed through this chokepoint.
+    """
+    if mode != "commit":
+        return False
+    contract = state.get("contract") or {}
+    goal_id = state.get("goal", "goal")
+    # Re-evaluate the Box-5 gate HERE, at the mutation site (non-bypassable choke).
+    gate_mode, _ = effective_mode(state, task)
+    if gate_mode != "commit":
+        alert(f"Box-5 gate re-check at mutation site DENIED commit of {task['id']} on {goal_id!r}.")
+        log_append({"event": "commit_denied", "task": task["id"], "reason": "gate_recheck"})
+        return False
+    # Box 0 HARD-DENY (not a silent downgrade): a durable mutation requires an independently
+    # ratified contract. Refuse loudly; do NOT quietly behave as propose.
+    if not contract_ratified(contract):
+        alert(f"Box-0 HARD-DENY: refused durable mutation (commit) of {task['id']} on {goal_id!r} "
+              f"— contract not independently ratified "
+              f"(ratified_by={contract.get('ratified_by')!r}, proposed_by={contract.get('proposed_by')!r}).")
+        log_append({"event": "commit_denied", "task": task["id"], "reason": "contract_not_ratified"})
+        return False
+    run(f"git add -A && git commit -m 'driver: {task['id']}'", repo)
+    log_append({"event": "commit", "task": task["id"]})
+    return True
 
 
 def main() -> int:
@@ -148,19 +264,24 @@ def main() -> int:
     tick = state.get("tick_seconds", 1)
     budget = state.get("budget", {})
     contract = state.get("contract") or {}
+    aar_cfg = {k: state.get(k) for k in ("aar_tool", "aar_priv", "subject", "principal", "verifier")}
 
-    # --- Box 0 gate: a move may not begin without a contract whose ratifier is not its
-    #     proposer. Missing / self-ratified -> loud alert + forced propose-only. ---
+    # --- Box 0 gate: a DURABLE MUTATION may not proceed without a contract whose ratifier
+    #     is not its proposer. Enforcement is a HARD-DENY at the mutation chokepoint
+    #     (apply_mutation), NOT a silent downgrade. We surface the condition early here;
+    #     a propose-mode run performs no durable mutation, so it proceeds normally even
+    #     with no/unratified contract (the keyless / propose path stays live). ---
     proposed_by, ratified_by = contract.get("proposed_by"), contract.get("ratified_by")
-    if not contract:
-        alert(f"no Box-0 contract on goal {goal_id!r} — running propose-only, unratified.")
-    elif not ratified_by or ratified_by == proposed_by:
-        alert(f"contract NOT independently ratified (ratified_by={ratified_by!r}, "
-              f"proposed_by={proposed_by!r}) on {goal_id!r} — propose-only until a third party ratifies.")
+    if not contract_ratified(contract):
+        alert(f"Box-0 contract NOT independently ratified on {goal_id!r} "
+              f"(ratified_by={ratified_by!r}, proposed_by={proposed_by!r}) — any durable mutation "
+              f"(commit) will be HARD-DENIED until a third party ratifies; propose-mode still runs.")
 
-    mode, why = effective_mode(state)
+    # Banner reflects the gate for the FIRST pending task (reversibility is per-task, so a
+    # single goal-level line would mislead); the loop re-decides per task authoritatively.
+    mode, why = effective_mode(state, next_pending(state))
     print(f"[{now()}] driver up — goal: {goal_id!r}  mode={mode} ({why})")
-    aar_append({"event": "driver_up", "goal": goal_id, "mode": mode,
+    log_append({"event": "driver_up", "goal": goal_id, "mode": mode,
                 "ratified_by": ratified_by, "proposed_by": proposed_by})
 
     runs = state.get("runs", 0)
@@ -170,13 +291,13 @@ def main() -> int:
         # --- Box 5 governor: the control the 131-duplicate incident lacked. ---
         if budget.get("max_worker_runs") and runs >= budget["max_worker_runs"]:
             msg = f"BUDGET HALT — {runs} worker-runs hit max_worker_runs={budget['max_worker_runs']} on {goal_id!r}."
-            aar_append({"event": "budget_halt", "runs": runs})
+            log_append({"event": "budget_halt", "runs": runs})
             alert(msg)
             print(f"[{now()}] {msg}")
             return 2
         if budget.get("max_wall_seconds") and (time.monotonic() - t0) >= budget["max_wall_seconds"]:
             msg = f"BUDGET HALT — wall-clock hit max_wall_seconds={budget['max_wall_seconds']} on {goal_id!r}."
-            aar_append({"event": "budget_halt", "wall_s": round(time.monotonic() - t0)})
+            log_append({"event": "budget_halt", "wall_s": round(time.monotonic() - t0)})
             alert(msg)
             print(f"[{now()}] {msg}")
             return 2
@@ -185,7 +306,7 @@ def main() -> int:
         if task is None:
             blocked = [t for t in state["tasks"] if t.get("status") == "blocked"]
             print(f"[{now()}] GOAL COMPLETE — {len(state['tasks'])} tasks, {len(blocked)} blocked/surfaced.")
-            aar_append({"event": "goal_complete", "tasks": len(state["tasks"]), "blocked": len(blocked)})
+            log_append({"event": "goal_complete", "tasks": len(state["tasks"]), "blocked": len(blocked)})
             return 0
 
         task["attempts"] = task.get("attempts", 0) + 1
@@ -194,7 +315,7 @@ def main() -> int:
         ikey = idem_key(goal_id, task)
         save(state)
         print(f"[{now()}] -> {task['id']} (attempt {task['attempts']}): {task['goal']}")
-        aar_append({"event": "dispatch", "task": task["id"], "attempt": task["attempts"], "idempotency_key": ikey})
+        log_append({"event": "dispatch", "task": task["id"], "attempt": task["attempts"], "idempotency_key": ikey})
 
         # 3. WORKER — fresh process; the only judgment in the whole loop.
         run(worker_cmd.format(task=task["goal"]), repo)
@@ -213,25 +334,32 @@ def main() -> int:
             task["status"] = "done"
             task["done"] = now()
             state["last_success_at"] = now()           # observability heartbeat
+            # Δ1: evaluate the gate PER-TASK — reversibility is a per-task term, so the
+            # autonomy decision can differ task to task even within one goal.
+            task_mode, task_why = effective_mode(state, task)
             print(f"[{now()}]    ok  verified.")
-            aar_append({"event": "verified", "task": task["id"], "verify_exit": 0,
-                        "verifier_id": verify_cmd, "idempotency_key": ikey, "autonomy_used": mode})
-            # 5. AUTONOMY — propose leaves the diff for review; commit proceeds.
-            if mode == "commit":
-                run(f"git add -A && git commit -m 'driver: {task['id']}'", repo)
-                print(f"[{now()}]    committed.")
-                aar_append({"event": "commit", "task": task["id"]})
+            log_append({"event": "verified", "task": task["id"], "verify_exit": 0,
+                        "verifier_id": verify_cmd, "idempotency_key": ikey, "autonomy_used": task_mode})
+            emit_aar(task, vcode, vout, repo, verify_cmd, aar_cfg)   # signed AAR — verified/confirmed
+            # 5. AUTONOMY — propose leaves the diff for review; commit proceeds, but ONLY
+            #    through the single apply_mutation chokepoint (re-checks gate + Box 0).
+            if task_mode == "commit":
+                if apply_mutation(repo, task, task_mode, state):
+                    print(f"[{now()}]    committed.")
+                else:
+                    print(f"[{now()}]    commit REFUSED (Box-0 / gate re-check) — diff left in the working tree.")
             else:
-                print(f"[{now()}]    (propose mode — diff left for your review)")
+                print(f"[{now()}]    (propose mode — {task_why}; diff left for your review)")
         elif task["attempts"] >= max_attempts:
             task["status"] = "blocked"                 # terminal quarantine — surfaced, not re-queued
             task["reason"] = f"verify failed {max_attempts}x"
-            aar_append({"event": "quarantine", "task": task["id"], "verify_exit": vcode, "idempotency_key": ikey})
+            log_append({"event": "quarantine", "task": task["id"], "verify_exit": vcode, "idempotency_key": ikey})
             alert(f"task {task['id']} QUARANTINED on {goal_id!r} after {max_attempts} failed verifies — surfaced, not skipped.")
+            emit_aar(task, vcode, vout, repo, verify_cmd, aar_cfg)   # signed AAR — rejected/contradicted
             print(f"[{now()}]    BLOCKED after {max_attempts} attempts — surfaced + alerted.")
         else:
             task["status"] = "pending"   # re-queue: a fresh worker, fresh context, tries again
-            aar_append({"event": "requeue", "task": task["id"], "verify_exit": vcode})
+            log_append({"event": "requeue", "task": task["id"], "verify_exit": vcode})
             print(f"[{now()}]    verify failed — re-queueing for a fresh attempt.")
 
         save(state)

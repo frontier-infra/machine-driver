@@ -38,7 +38,7 @@ def run_driver(goal_path):
 
 
 def aar_events(d):
-    return [json.loads(l)["event"] for l in (Path(d) / "aar.jsonl").read_text().splitlines()]
+    return [json.loads(l)["event"] for l in (Path(d) / "driver-log.jsonl").read_text().splitlines()]
 
 
 class DriverConformance(unittest.TestCase):
@@ -75,7 +75,7 @@ class DriverConformance(unittest.TestCase):
                            contract={"proposed_by": "p", "ratified_by": "council", "autonomy_ceiling": 1})
             run_driver(g)
             prev = ""
-            for ln in (Path(d) / "aar.jsonl").read_text().splitlines():
+            for ln in (Path(d) / "driver-log.jsonl").read_text().splitlines():
                 rec = json.loads(ln)
                 h = rec.pop("hash")
                 calc = hashlib.sha256((prev + json.dumps(rec, sort_keys=True)).encode()).hexdigest()[:16]

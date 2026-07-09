@@ -64,6 +64,59 @@ class SignedAAR(unittest.TestCase):
             self.assertTrue((d / "driver-log.jsonl").exists())
             self.assertFalse((d / "aar.jsonl").exists())
 
+    def test_relative_key_path_anchors_to_goal_dir_not_cwd(self):
+        """Regression (2026-07-07 stack-demo run): relative aar_priv resolution silently
+        depended on subprocess cwd. Contract now: relative anchors to goal.json's dir —
+        signing must succeed even when the driver runs from a completely different cwd."""
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as elsewhere:
+            d = Path(tmp)
+            repo = d / "repo"; repo.mkdir()
+            keys = d / "keys"; keys.mkdir()
+            priv, didj = keys / "k.jwk.json", d / "did.json"
+            subprocess.run(["node", str(AAR_MJS), "keygen", "--did", "did:web:example.com",
+                            "--out-priv", str(priv), "--out-did", str(didj)],
+                           check=True, capture_output=True, text=True)
+            goal = {
+                "goal": "g", "repo": str(repo), "mode": "propose",
+                "worker_cmd": "true", "verify_cmd": "true",
+                "aar_tool": str(AAR_MJS), "aar_priv": "keys/k.jwk.json",  # goal-dir-relative
+                "subject": "did:web:example.com:machine-driver",
+                "principal": "did:web:example.com",
+                "tasks": [{"id": "t1", "goal": "x", "status": "pending"}],
+            }
+            gp = d / "goal.json"
+            gp.write_text(json.dumps(goal))
+            # run from an unrelated cwd — resolution must not depend on it
+            r = subprocess.run([sys.executable, str(DRIVER), str(gp)],
+                               capture_output=True, text=True, cwd=str(elsewhere))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            rec = json.loads((d / "aar" / "t1.json").read_text())
+            self.assertIn("sig", rec, "relative key path signed from foreign cwd")
+            v = subprocess.run(["node", str(AAR_MJS), "verify", str(d / "aar" / "t1.json"),
+                                "--did-json", str(didj)], capture_output=True, text=True)
+            self.assertIn("conformance: L2", v.stdout, v.stdout + v.stderr)
+
+    def test_missing_key_alerts_resolved_path_and_leaves_unsigned_record(self):
+        """A bad key path must alert with the FULL resolved path (not node's cryptic ENOENT)
+        and leave the unsigned record on disk for later signing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "repo").mkdir()
+            goal = {
+                "goal": "g", "repo": str(d / "repo"), "mode": "propose",
+                "worker_cmd": "true", "verify_cmd": "true",
+                "aar_tool": str(AAR_MJS), "aar_priv": "keys/nope.jwk.json",
+                "subject": "did:web:example.com:machine-driver",
+                "principal": "did:web:example.com",
+                "tasks": [{"id": "t1", "goal": "x", "status": "pending"}],
+            }
+            r = self._run_driver(d, goal)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("AAR sign SKIPPED", r.stdout)
+            self.assertIn(str(d / "keys" / "nope.jwk.json"), r.stdout, "alert names resolved path")
+            rec = json.loads((d / "aar" / "t1.json").read_text())
+            self.assertNotIn("sig", rec, "record left unsigned, intact")
+
     def test_keyless_skips_aar_but_still_logs(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)

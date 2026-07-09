@@ -120,6 +120,15 @@ def idem_key(goal_id: str, task: dict) -> str:
     return hashlib.sha256(f"{goal_id}|{task['id']}|{task['goal']}".encode()).hexdigest()[:16]
 
 
+def _cfg_path(p) -> Path:
+    """aar_tool / aar_priv resolution: '~' expands; a relative path anchors to goal.json's
+    directory (NOT the driver's cwd) — the goal file is the config, so it is the anchor.
+    Regression: 2026-07-07 stack-demo run, a repo-root-relative key path hit ENOENT because
+    resolution silently depended on subprocess cwd."""
+    q = Path(p).expanduser()
+    return q if q.is_absolute() else (GOAL_PATH.resolve().parent / q).resolve()
+
+
 def emit_aar(task: dict, vcode: int, vout: str, repo: str, verify_cmd, aar_cfg: dict):
     """Box-4 PROOF: one canonical, Ed25519-signed AAR per RESOLVED task — our own standard
     (agentscontrolplane.org), so the driver MUST emit it. Deterministic plumbing; no model
@@ -130,6 +139,7 @@ def emit_aar(task: dict, vcode: int, vout: str, repo: str, verify_cmd, aar_cfg: 
     subject, principal = aar_cfg.get("subject"), aar_cfg.get("principal")
     if not (tool and priv and subject and principal):
         return None  # keyless — no signing identity; loop audit still written
+    tool, priv = _cfg_path(tool), _cfg_path(priv)
     AAR_DIR.mkdir(parents=True, exist_ok=True)
     verified = vcode == 0
     rec = {
@@ -153,6 +163,12 @@ def emit_aar(task: dict, vcode: int, vout: str, repo: str, verify_cmd, aar_cfg: 
     }
     out = AAR_DIR / f"{task['id']}.json"
     out.write_text(json.dumps(rec, indent=2))
+    # Pre-check the resolved paths so a config mistake alerts with the FULL path, not a
+    # cryptic ENOENT from node. The unsigned record stays on disk either way (sign later).
+    missing = [str(p) for p in (tool, priv) if not p.exists()]
+    if missing:
+        alert(f"AAR sign SKIPPED for task {task['id']}: missing {', '.join(missing)} — record left unsigned at {out}")
+        return str(out)
     # sign with OUR OWN signer (eat our own cooking) — driver stays pure-Python, shells to node.
     rc, sout = run(
         f"node {shlex.quote(str(tool))} sign {shlex.quote(str(out))} --priv {shlex.quote(str(priv))}",
